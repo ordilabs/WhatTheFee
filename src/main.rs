@@ -6,7 +6,11 @@ use arrow::{
 
 use reqwest::Error;
 use serde::Deserialize;
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Instant,
+};
 use tokio::time::{sleep, Duration};
 
 use parquet::{arrow::ArrowWriter, basic::Compression, file::properties::WriterProperties};
@@ -58,54 +62,115 @@ pub struct ChainInfo {
     pub warnings: String,
 }
 
+type Mempool = HashMap<String, MempoolEntry>;
+
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     // Set the bitcoind REST URL. run bitcoin core 25.0+ with -rest
 
-    let chaininfo = "http://127.0.0.1:8332/rest/chaininfo.json";
-    let response = reqwest::Client::new().get(chaininfo).send().await?;
-
-    if response.status().is_success() {
-        let chaininfo: ChainInfo = response.json().await?;
-        println!("chain_blocks: {}", chaininfo.blocks);
-    } else {
-        eprintln!("Error requesting chaininfo: {}", response.status());
-    }
+    let mut prev_height = 0u64;
+    let mut this_height;
+    let mut prev_mempool: Mempool = HashMap::new();
+    let mut this_mempool: Mempool;
 
     loop {
-        tick().await?;
+        // check height
+        this_height = load_height().await?;
+
+        if prev_height != this_height {
+            prev_mempool = HashMap::new();
+            println!("new_height: {:?}", this_height);
+        }
+
+        let start = Instant::now();
+        this_mempool = load_mempool().await?;
+        let duration = start.elapsed();
+
+        let batch = create_batchrecord_delta_from_pools(&prev_mempool, &this_mempool);
+
+        println!(
+            "batch_num_rows: {:?}, load_mempool_duration_millis: {:?}",
+            batch.num_rows(),
+            duration.as_millis()
+        );
+
+        save_batchrecord_deltas_to_parquet(batch);
+
         sleep(Duration::from_secs(3)).await;
+
+        prev_height = this_height;
+        prev_mempool = this_mempool;
     }
 }
 
-async fn tick() -> Result<(), Error> {
-    let start = Instant::now();
+fn save_batchrecord_deltas_to_parquet(batch: RecordBatch) {
+    let file = std::fs::File::create("data/test.parquet").unwrap();
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .build();
+    let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props)).unwrap();
+
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+}
+
+async fn load_height() -> Result<u64, Error> {
+    let chaininfo = "http://127.0.0.1:8332/rest/chaininfo.json";
+    let response = reqwest::Client::new().get(chaininfo).send().await?;
+
+    if !response.status().is_success() {
+        eprintln!("Error requesting chaininfo: {}", response.status());
+    }
+
+    let chaininfo: ChainInfo = response.json().await?;
+    Ok(chaininfo.blocks)
+}
+
+async fn load_mempool() -> Result<Mempool, Error> {
     let mempool = "http://127.0.0.1:8332/rest/mempool/contents.json";
     let response = reqwest::Client::new().get(mempool).send().await?;
-    let duration = start.elapsed();
 
     if !response.status().is_success() {
         panic!("Error downloading mempool: {}", response.status());
     }
 
     // Deserialize the JSON response into a HashSet
-    let mempool: HashMap<String, MempoolEntry> = response.json().await?;
-    println!("mempool_len: {} ", mempool.len());
-    let capacity = mempool.len();
+    Ok(response.json().await?)
+}
+
+fn create_batchrecord_delta_from_pools(
+    prev_mempool: &Mempool,
+    this_mempool: &Mempool,
+) -> RecordBatch {
+    let (keys_removed, keys_added) = delta_of_keys(&prev_mempool, &this_mempool);
+
+    // TODO: combine into one batch:
+
+    let capacity = keys_removed.len() + keys_added.len();
 
     let mut txid_values: Vec<String> = Vec::with_capacity(capacity);
     let mut weight_values: Vec<f64> = Vec::with_capacity(capacity);
     let mut fee_sat_values: Vec<f64> = Vec::with_capacity(capacity);
     let mut first_seen_timestamp_values: Vec<u64> = Vec::with_capacity(capacity);
-    let mut fee_sum_btc = 0.;
 
-    for (txid, entry) in mempool.iter() {
-        println!("Transaction ID: {}", txid);
+    for txid in keys_removed.iter() {
+        let entry = prev_mempool.get(txid).unwrap();
+        let weight: f64 = entry.weight as f64 * (-1.);
+
         txid_values.push(txid.clone());
-        weight_values.push(entry.weight as f64);
+        weight_values.push(weight);
         fee_sat_values.push(entry.fees.base * 1e8);
         first_seen_timestamp_values.push(entry.time);
-        fee_sum_btc += entry.fees.base;
+    }
+
+    for txid in keys_added.iter() {
+        let entry = this_mempool.get(txid).unwrap();
+        let weight = entry.weight as f64;
+
+        txid_values.push(txid.clone());
+        weight_values.push(weight);
+        fee_sat_values.push(entry.fees.base * 1e8);
+        first_seen_timestamp_values.push(entry.time);
     }
 
     let txid_array: ArrayRef = Arc::new(StringArray::from(txid_values));
@@ -132,17 +197,30 @@ async fn tick() -> Result<(), Error> {
     )
     .unwrap();
 
-    let file = std::fs::File::create("data/test.parquet").unwrap();
-    let props = WriterProperties::builder()
-        .set_compression(Compression::SNAPPY)
-        .build();
-    let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props)).unwrap();
+    batch
+}
 
-    writer.write(&batch).unwrap();
-    writer.close().unwrap();
+fn delta_of_keys<T>(
+    map1: &HashMap<String, T>,
+    map2: &HashMap<String, T>,
+) -> (Vec<String>, Vec<String>) {
+    let mut intersection = HashSet::new();
+    let mut keys_added = Vec::new();
+    let mut keys_removed = Vec::new();
 
-    println!("fee_sum_btc: {:?}", fee_sum_btc);
-    println!("duration_millis: {:?}", duration.as_millis());
+    for key in map1.keys() {
+        if map2.contains_key(key) {
+            intersection.insert(key.to_string());
+        } else {
+            keys_removed.push(key.to_string());
+        }
+    }
 
-    Ok(())
+    for key in map2.keys() {
+        if !intersection.contains(key) {
+            keys_added.push(key.to_string());
+        }
+    }
+
+    (keys_removed, keys_added)
 }
