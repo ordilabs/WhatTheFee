@@ -4,6 +4,7 @@ use arrow::{
     record_batch::RecordBatch,
 };
 
+use chrono::Timelike;
 use reqwest::Error;
 use serde::Deserialize;
 use std::{
@@ -72,12 +73,21 @@ async fn main() -> Result<(), Error> {
     let mut this_height;
     let mut prev_mempool: Mempool = HashMap::new();
     let mut this_mempool: Mempool;
+    let mut prev_timestamp = 0i64;
 
     loop {
+        let now = chrono::Utc::now();
+
+        // execute once per quarter-minute (:00/:15/:30/:45), prevent double execution
+        if !(prev_timestamp != now.timestamp() && now.second() % 15 == 0) {
+            sleep(Duration::from_millis(50)).await;
+            continue;
+        }
+
         // check height
         this_height = load_height().await?;
-
-        if prev_height != this_height {
+        let is_new_height = prev_height != this_height;
+        if is_new_height {
             prev_mempool = HashMap::new();
             println!("new_height: {:?}", this_height);
         }
@@ -94,17 +104,26 @@ async fn main() -> Result<(), Error> {
             duration.as_millis()
         );
 
-        save_batchrecord_deltas_to_parquet(batch);
-
-        sleep(Duration::from_secs(3)).await;
+        let mut filename = std::path::PathBuf::new();
+        let day = now.format("%Y/%m/%d").to_string();
+        let timestamp = now.timestamp();
+        let suffix = if is_new_height { "full" } else { "delta" };
+        filename.push("data");
+        filename.extend(day.split('/'));
+        filename.push(format!("{this_height}_{timestamp}_{suffix}.parquet"));
+        save_batchrecord_deltas_to_parquet(batch, filename);
 
         prev_height = this_height;
         prev_mempool = this_mempool;
+        prev_timestamp = now.timestamp();
     }
 }
 
-fn save_batchrecord_deltas_to_parquet(batch: RecordBatch) {
-    let file = std::fs::File::create("data/test.parquet").unwrap();
+fn save_batchrecord_deltas_to_parquet(batch: RecordBatch, filename: std::path::PathBuf) {
+    // make sure the folder exists
+    std::fs::create_dir_all(filename.parent().unwrap()).unwrap();
+
+    let file = std::fs::File::create(filename).unwrap();
     let props = WriterProperties::builder()
         .set_compression(Compression::SNAPPY)
         .build();
@@ -176,24 +195,18 @@ fn create_batchrecord_delta_from_pools(
     let txid_array: ArrayRef = Arc::new(StringArray::from(txid_values));
     let weight_array: ArrayRef = Arc::new(Float64Array::from(weight_values));
     let fee_sat_array: ArrayRef = Arc::new(Float64Array::from(fee_sat_values));
-    let first_seen_timestamp_array: ArrayRef =
-        Arc::new(UInt64Array::from(first_seen_timestamp_values));
+    let first_seen_at_array: ArrayRef = Arc::new(UInt64Array::from(first_seen_timestamp_values));
 
     let schema = Schema::new(vec![
         Field::new("txid", DataType::Utf8, false),
         Field::new("weight", DataType::Float64, false),
         Field::new("fee_sat", DataType::Float64, false),
-        Field::new("first_seen_timestamp", DataType::UInt64, true),
+        Field::new("first_seen_at", DataType::UInt64, true),
     ]);
 
     let batch = RecordBatch::try_new(
         Arc::new(schema),
-        vec![
-            txid_array,
-            weight_array,
-            fee_sat_array,
-            first_seen_timestamp_array,
-        ],
+        vec![txid_array, weight_array, fee_sat_array, first_seen_at_array],
     )
     .unwrap();
 

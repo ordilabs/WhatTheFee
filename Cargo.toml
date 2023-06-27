@@ -7,6 +7,7 @@ edition = "2021"
 
 [dependencies]
 arrow = "42.0.0"
+chrono = "0.4.26"
 parquet = "42.0.0"
 reqwest = { version = "0.11.18", features = ["json"] }
 serde = { version = "1.0.164", features = ["derive"] }
