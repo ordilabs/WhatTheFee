@@ -12,7 +12,6 @@ use std::{
     sync::Arc,
     time::Instant,
 };
-use tokio::time::{sleep, Duration};
 
 use parquet::{arrow::ArrowWriter, basic::Compression, file::properties::WriterProperties};
 
@@ -76,11 +75,10 @@ async fn main() -> Result<(), Error> {
     let mut prev_timestamp = 0i64;
 
     loop {
+        // execute once per quarter-minute (:00/:15/:30/:45), preventing double execution
         let now = chrono::Utc::now();
-
-        // execute once per quarter-minute (:00/:15/:30/:45), prevent double execution
-        if !(prev_timestamp != now.timestamp() && now.second() % 15 == 0) {
-            sleep(Duration::from_millis(50)).await;
+        if now.second() % 15 != 0 || prev_timestamp == now.timestamp() {
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             continue;
         }
 
