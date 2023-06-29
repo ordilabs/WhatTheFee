@@ -1,0 +1,14 @@
+[package]
+name = "wtf"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+arrow = "42.0.0"
+chrono = "0.4.26"
+parquet = "42.0.0"
+reqwest = { version = "0.11.18", features = ["json"] }
+serde = { version = "1.0.164", features = ["derive"] }
+tokio = { version = "1.28.2", features = ["macros", "full"] }
