@@ -4,9 +4,9 @@ use arrow::{
     record_batch::RecordBatch,
 };
 
+use bitcoin::{Denomination, Txid};
+use bitcoincore_rest::{responses::GetMempoolEntryResult, Error, Network, RestApi, RestClient};
 use chrono::Timelike;
-use reqwest::Error;
-use serde::Deserialize;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -15,58 +15,11 @@ use std::{
 
 use parquet::{arrow::ArrowWriter, basic::Compression, file::properties::WriterProperties};
 
-#[derive(Deserialize, Debug)]
-#[allow(dead_code)]
-struct MempoolEntry {
-    vsize: u32,
-    weight: u32,
-    time: u64,
-    height: u32,
-    descendantcount: u32,
-    descendantsize: u32,
-    ancestorcount: u32,
-    ancestorsize: u32,
-    wtxid: String,
-    fees: Fees,
-    depends: Vec<String>,
-    spentby: Vec<String>,
-    #[serde(rename = "bip125-replaceable")]
-    bip125_replaceable: bool,
-    unbroadcast: bool,
-}
-
-#[derive(Deserialize, Debug)]
-#[allow(dead_code)]
-struct Fees {
-    base: f64,
-    modified: f64,
-    ancestor: f64,
-    descendant: f64,
-}
-
-#[derive(Deserialize, Debug)]
-//#[allow(dead_code)]
-pub struct ChainInfo {
-    pub chain: String,
-    pub blocks: u64,
-    pub headers: u64,
-    pub bestblockhash: String,
-    pub difficulty: f64,
-    pub time: u64,
-    pub mediantime: u64,
-    pub verificationprogress: f64,
-    pub initialblockdownload: bool,
-    pub chainwork: String,
-    pub size_on_disk: u64,
-    pub pruned: bool,
-    pub warnings: String,
-}
-
-type Mempool = HashMap<String, MempoolEntry>;
+type Mempool = HashMap<Txid, GetMempoolEntryResult>;
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    // Set the bitcoind REST URL. run bitcoin core 25.0+ with -rest
+    let rest_client = RestClient::network_default(Network::Bitcoin);
 
     let mut prev_height = 0u64;
     let mut this_height;
@@ -83,7 +36,7 @@ async fn main() -> Result<(), Error> {
         }
 
         // check height
-        this_height = load_height().await?;
+        this_height = rest_client.get_chain_info().await?.blocks;
         let is_new_height = prev_height != this_height;
         if is_new_height {
             prev_mempool = HashMap::new();
@@ -91,7 +44,7 @@ async fn main() -> Result<(), Error> {
         }
 
         let start = Instant::now();
-        this_mempool = load_mempool().await?;
+        this_mempool = rest_client.get_mempool().await?;
         let duration = start.elapsed();
 
         let batch = create_batchrecord_delta_from_pools(&prev_mempool, &this_mempool);
@@ -131,35 +84,11 @@ fn save_batchrecord_deltas_to_parquet(batch: RecordBatch, filename: std::path::P
     writer.close().unwrap();
 }
 
-async fn load_height() -> Result<u64, Error> {
-    let chaininfo = "http://127.0.0.1:8332/rest/chaininfo.json";
-    let response = reqwest::Client::new().get(chaininfo).send().await?;
-
-    if !response.status().is_success() {
-        eprintln!("Error requesting chaininfo: {}", response.status());
-    }
-
-    let chaininfo: ChainInfo = response.json().await?;
-    Ok(chaininfo.blocks)
-}
-
-async fn load_mempool() -> Result<Mempool, Error> {
-    let mempool = "http://127.0.0.1:8332/rest/mempool/contents.json";
-    let response = reqwest::Client::new().get(mempool).send().await?;
-
-    if !response.status().is_success() {
-        panic!("Error downloading mempool: {}", response.status());
-    }
-
-    // Deserialize the JSON response into a HashSet
-    Ok(response.json().await?)
-}
-
 fn create_batchrecord_delta_from_pools(
     prev_mempool: &Mempool,
     this_mempool: &Mempool,
 ) -> RecordBatch {
-    let (keys_removed, keys_added) = delta_of_keys(&prev_mempool, &this_mempool);
+    let (keys_removed, keys_added) = delta_of_keys(prev_mempool, this_mempool);
 
     // TODO: combine into one batch:
 
@@ -172,21 +101,21 @@ fn create_batchrecord_delta_from_pools(
 
     for txid in keys_removed.iter() {
         let entry = prev_mempool.get(txid).unwrap();
-        let weight: f64 = entry.weight as f64 * (-1.);
+        let weight: f64 = entry.weight.unwrap() as f64 * (-1.);
 
-        txid_values.push(txid.clone());
+        txid_values.push(txid.to_string());
         weight_values.push(weight);
-        fee_sat_values.push(entry.fees.base * 1e8);
+        fee_sat_values.push(entry.fees.base.to_float_in(Denomination::Satoshi));
         first_seen_timestamp_values.push(entry.time);
     }
 
     for txid in keys_added.iter() {
         let entry = this_mempool.get(txid).unwrap();
-        let weight = entry.weight as f64;
+        let weight = entry.weight.unwrap() as f64;
 
-        txid_values.push(txid.clone());
+        txid_values.push(txid.to_string());
         weight_values.push(weight);
-        fee_sat_values.push(entry.fees.base * 1e8);
+        fee_sat_values.push(entry.fees.base.to_float_in(Denomination::Satoshi));
         first_seen_timestamp_values.push(entry.time);
     }
 
@@ -202,34 +131,29 @@ fn create_batchrecord_delta_from_pools(
         Field::new("first_seen_at", DataType::UInt64, true),
     ]);
 
-    let batch = RecordBatch::try_new(
+    RecordBatch::try_new(
         Arc::new(schema),
         vec![txid_array, weight_array, fee_sat_array, first_seen_at_array],
     )
-    .unwrap();
-
-    batch
+    .unwrap()
 }
 
-fn delta_of_keys<T>(
-    map1: &HashMap<String, T>,
-    map2: &HashMap<String, T>,
-) -> (Vec<String>, Vec<String>) {
+fn delta_of_keys(map1: &Mempool, map2: &Mempool) -> (Vec<Txid>, Vec<Txid>) {
     let mut intersection = HashSet::new();
     let mut keys_added = Vec::new();
     let mut keys_removed = Vec::new();
 
     for key in map1.keys() {
         if map2.contains_key(key) {
-            intersection.insert(key.to_string());
+            intersection.insert(key);
         } else {
-            keys_removed.push(key.to_string());
+            keys_removed.push(*key);
         }
     }
 
     for key in map2.keys() {
         if !intersection.contains(key) {
-            keys_added.push(key.to_string());
+            keys_added.push(*key);
         }
     }
 
