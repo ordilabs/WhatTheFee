@@ -10,7 +10,7 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use bitcoin::{Denomination, Txid};
-use bitcoincore_rest::{responses::GetMempoolEntryResult, Error, Network, RestApi, RestClient};
+use bitcoincore_rest::{responses::GetMempoolEntryResult, Error, RestApi, RestClient};
 use chrono::Timelike;
 use parquet::{arrow::ArrowWriter, basic::Compression, file::properties::WriterProperties};
 use tracing::info;
@@ -21,8 +21,8 @@ pub struct Record;
 
 impl Record {
     #[tracing::instrument]
-    pub async fn record() -> Result<(), Error> {
-        let rest_client = RestClient::network_default(Network::Bitcoin);
+    pub async fn record(data_dir: String, bitcoin_core_endpoint: String) -> Result<(), Error> {
+        let rest_client = RestClient::new(bitcoin_core_endpoint);
 
         let mut prev_height = 0u64;
         let mut this_height;
