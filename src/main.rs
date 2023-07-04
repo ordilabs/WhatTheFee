@@ -1,18 +1,32 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use tracing::metadata::LevelFilter;
+use tracing::{info, metadata::LevelFilter};
 use tracing_subscriber::EnvFilter;
 use wtf::record::Record;
 
 #[derive(Parser)]
 struct Cli {
+    /// Data directory for mempool recording
+    #[arg(short, long, default_value_t = String::from("data"))]
+    data_dir: String,
     #[command(subcommand)]
     command: Commands,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    Record,
+    /// Begin recording mempool data
+    Record {
+        /// Bitcoin Core REST endpoint
+        #[arg(short, long, default_value_t = String::from("http://localhost:8332/rest/"))]
+        bitcoin_core_endpoint: String,
+    },
+    /// Calculate the fee
+    Calc {
+        /// Confidence percentage
+        #[arg(short, long, default_value_t = 0.95)]
+        confidence: f64,
+    },
 }
 
 #[tokio::main]
@@ -24,9 +38,14 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    match &cli.command {
-        Commands::Record => {
-            Record::record().await?;
+    match cli.command {
+        Commands::Record {
+            bitcoin_core_endpoint,
+        } => {
+            Record::record(cli.data_dir, bitcoin_core_endpoint).await?;
+        }
+        Commands::Calc { confidence } => {
+            info!("calc confidence {confidence}");
         }
     }
 
