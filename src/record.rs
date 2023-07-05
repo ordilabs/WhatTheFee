@@ -69,14 +69,7 @@ impl Record {
     fn save_dataframe_delta_to_parquet(mut delta: DataFrame, filename: std::path::PathBuf) {
         // make sure the folder exists
         std::fs::create_dir_all(filename.parent().unwrap()).unwrap();
-
         let file = std::fs::File::create(filename).unwrap();
-        // let mut df = DataFrame::new(vec![
-        //     Series::new("c1", &[1, 2, 3, 4, 5]),
-        //     Series::new("c2", &[1, 2, 3, 4, 5]),
-        // ])
-        // .unwrap();
-
         ParquetWriter::new(file)
             .with_compression(polars::prelude::ParquetCompression::Zstd(Default::default()))
             .with_statistics(true)
