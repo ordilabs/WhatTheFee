@@ -1,18 +1,11 @@
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-    time::Instant,
-};
-
-use arrow::{
-    array::{ArrayRef, Float64Array, StringArray, UInt64Array},
-    datatypes::{DataType, Field, Schema},
-    record_batch::RecordBatch,
-};
 use bitcoin::{Denomination, Txid};
 use bitcoincore_rest::{responses::GetMempoolEntryResult, Error, RestApi, RestClient};
 use chrono::Timelike;
-use parquet::{arrow::ArrowWriter, basic::Compression, file::properties::WriterProperties};
+use polars::prelude::*;
+use std::{
+    collections::{HashMap, HashSet},
+    time::Instant,
+};
 use tracing::info;
 
 type Mempool = HashMap<Txid, GetMempoolEntryResult>;
@@ -50,11 +43,11 @@ impl Record {
             this_mempool = rest_client.get_mempool().await?;
             let duration = start.elapsed();
 
-            let batch = Self::create_batchrecord_delta_from_pools(&prev_mempool, &this_mempool);
+            let delta = Self::create_delta_from_pools(&prev_mempool, &this_mempool);
 
             info!(
-                "batch_num_rows: {:?}, load_mempool_duration_millis: {:?}",
-                batch.num_rows(),
+                "delta_height: {:?}, load_mempool_duration_millis: {:?}",
+                delta.height(),
                 duration.as_millis()
             );
 
@@ -65,7 +58,7 @@ impl Record {
             filename.push("data");
             filename.extend(day.split('/'));
             filename.push(format!("{this_height}_{timestamp}_{suffix}.parquet"));
-            Self::save_batchrecord_deltas_to_parquet(batch, filename);
+            Self::save_dataframe_delta_to_parquet(delta, filename);
 
             prev_height = this_height;
             prev_mempool = this_mempool;
@@ -73,27 +66,20 @@ impl Record {
         }
     }
 
-    fn save_batchrecord_deltas_to_parquet(batch: RecordBatch, filename: std::path::PathBuf) {
+    fn save_dataframe_delta_to_parquet(mut delta: DataFrame, filename: std::path::PathBuf) {
         // make sure the folder exists
         std::fs::create_dir_all(filename.parent().unwrap()).unwrap();
-
         let file = std::fs::File::create(filename).unwrap();
-        let props = WriterProperties::builder()
-            .set_compression(Compression::SNAPPY)
-            .build();
-        let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props)).unwrap();
-
-        writer.write(&batch).unwrap();
-        writer.close().unwrap();
+        ParquetWriter::new(file)
+            .with_compression(polars::prelude::ParquetCompression::Zstd(Default::default()))
+            .with_statistics(true)
+            .finish(&mut delta)
+            .map_err(PolarsError::from)
+            .unwrap();
     }
 
-    fn create_batchrecord_delta_from_pools(
-        prev_mempool: &Mempool,
-        this_mempool: &Mempool,
-    ) -> RecordBatch {
+    fn create_delta_from_pools(prev_mempool: &Mempool, this_mempool: &Mempool) -> DataFrame {
         let (keys_removed, keys_added) = Self::delta_of_keys(prev_mempool, this_mempool);
-
-        // TODO: combine into one batch:
 
         let capacity = keys_removed.len() + keys_added.len();
 
@@ -122,23 +108,12 @@ impl Record {
             first_seen_timestamp_values.push(entry.time);
         }
 
-        let txid_array: ArrayRef = Arc::new(StringArray::from(txid_values));
-        let weight_array: ArrayRef = Arc::new(Float64Array::from(weight_values));
-        let fee_sat_array: ArrayRef = Arc::new(Float64Array::from(fee_sat_values));
-        let first_seen_at_array: ArrayRef =
-            Arc::new(UInt64Array::from(first_seen_timestamp_values));
-
-        let schema = Schema::new(vec![
-            Field::new("txid", DataType::Utf8, false),
-            Field::new("weight", DataType::Float64, false),
-            Field::new("fee_sat", DataType::Float64, false),
-            Field::new("first_seen_at", DataType::UInt64, true),
-        ]);
-
-        RecordBatch::try_new(
-            Arc::new(schema),
-            vec![txid_array, weight_array, fee_sat_array, first_seen_at_array],
-        )
+        DataFrame::new(vec![
+            Series::new("txid", &txid_values),
+            Series::new("weight", &weight_values),
+            Series::new("fee_sat", &fee_sat_values),
+            Series::new("first_seen_at", first_seen_timestamp_values),
+        ])
         .unwrap()
     }
 
