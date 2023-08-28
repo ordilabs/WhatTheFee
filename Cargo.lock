@@ -288,16 +288,18 @@ dependencies = [
 
 [[package]]
 name = "bitcoincore-rest"
-version = "2.0.0"
+version = "3.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aa927c39a2050e5219688e0228381de6c895715d691bcf888f390554307f795f"
+checksum = "5546e1a1dbb4ac8cf339942c2c846eb83c07d523f0190a12bd444ec6f4cc52e4"
 dependencies = [
  "async-trait",
  "bitcoin",
  "bitcoincore-rpc-json",
  "bytes",
+ "http",
  "reqwest",
  "serde",
+ "url",
 ]
 
 [[package]]
